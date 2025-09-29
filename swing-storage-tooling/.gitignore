@@ -1,0 +1,6 @@
+.venv/
+*.log*
+*.old*
+*.bak
+.env
+.key*
