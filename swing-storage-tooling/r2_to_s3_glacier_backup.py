@@ -1,3 +1,9 @@
+# A simple backup script to backup swing backend videos from R2 to AWS S3 Glacier Deep Archive
+# Note: You need valid rclone credentials in config
+#
+import os
+from dotenv import load_dotenv
+import psycopg2
 import logging
 import sys
 import time
@@ -5,9 +11,25 @@ import time
 from rclone_python import rclone
 
 
-swing_listings_file = "swing_listing.txt"
-completed_swings_file = "migrated_swings.txt"
-swing_number = -1
+load_dotenv()
+r2_rclone_remote = "elva-r2"
+glacier_rclone_remote = "glacier-backup"
+# Ideally this would be queried from s3, but there is no quick way of doing that so we keep it around manually.
+last_uploaded_swing_file = ".last_uploaded_swing"
+
+
+def get_swing_count():
+    conn = psycopg2.connect(
+        host=os.getenv("DB_HOST"),
+        dbname=os.getenv("DB_DATABASE", "postgres"),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        port=int(os.getenv("DB_PORT", 5432)),
+        sslmode=os.getenv("PGSSLMODE", "require"),
+    )
+    with conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM swings;")
+        return cur.fetchone()[0]
 
 
 def get_logger(name='r2_to_glacier', log_file='r2_to_glacier.log', level=logging.INFO):
@@ -26,39 +48,47 @@ def get_logger(name='r2_to_glacier', log_file='r2_to_glacier.log', level=logging
     return logger
 
 
-def r2_to_s3_glacier_backup(swing_listing, swing_count):
-    global swing_number
+def r2_to_s3_glacier_backup(last_uploaded_swing: int, swing_count: int):
     logger = get_logger()
+    max_swing_id = get_swing_count()
+    if max_swing_id <= last_uploaded_swing:
+        logger.info("No swings need backup.")
+        return
+
     cur_swing_count = 0
-    with open(completed_swings_file) as cmp_fp:
-        completed_swings = set(s_nr.strip() for s_nr in cmp_fp.readlines())
-    total_number_of_swings = sum(1 for _ in open(swing_listing))
-    logger.info(f"Currently there are {total_number_of_swings} listed for migration")
-    logger.info(f"{len(completed_swings)}/{total_number_of_swings} swings already migrated")
-    logger.info(f"Starting migration of: {swing_count} swings")
-    with open(swing_listing) as ucmp_fp, open(completed_swings_file, 'a') as cmp_fp:
-        for swing_number in ucmp_fp:
-            swing_number = swing_number.strip()
-            if swing_number in completed_swings:
-                logger.debug(f"Already processed swing: {swing_number}")
-                continue
+    logger.info(f"Currently there are a total of {max_swing_id} swings in R2")
+    logger.info(f"{last_uploaded_swing}/{max_swing_id} swings are already backed up.")
+    logger.info(f"Starting backup of (up to): {swing_count} swings")
+    try:
+        for swing_number in range(last_uploaded_swing + 1, max_swing_id):
             logger.info(f"Working on swing: {swing_number}")
-            rclone.copy(f"elva-r2:elva-swings/{swing_number}/recordings",
-                        f"glacier-backup:swings-backup/{swing_number}/recordings/",
+            rclone.copy(f"{r2_rclone_remote}:elva-swings/{swing_number}/recordings",
+                        f"{glacier_rclone_remote}:swings-backup/{swing_number}/recordings/",
                         ignore_existing=True,
                         args=["--s3-storage-class", "DEEP_ARCHIVE"])
-            cmp_fp.write(f"{swing_number}\n")
+            update_last_uploaded_swing(swing_number)
             cur_swing_count += 1
             if swing_count > 0 and cur_swing_count >= swing_count:
                 logger.info("Reached the swing count buffer, exiting.")
                 break
+    except KeyboardInterrupt:
+        logger.info(f"Forcefully stopped at swing: {swing_number}")
+
+
+def update_last_uploaded_swing(swing_id: int):
+    with open(last_uploaded_swing_file, 'w') as fp:
+        fp.write(f"{swing_id}")
 
 
 if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("You must supply the number of swings to backup:", file=sys.stderr)
+        print(f"Usage:\n    python3 {__file__} NUMBER_OF_SWINGS\n", file=sys.stderr)
+        exit(1)
     logger = get_logger()
     start_of_execution = time.time()
-    try:
-        r2_to_s3_glacier_backup(swing_listings_file, int(sys.argv[1]))
-    except KeyboardInterrupt:
-        logger.info(f"Forcefully stopped at swing: {swing_number}")
+    last_uploaded_swing = -1
+    with open(last_uploaded_swing_file, 'r') as fp:
+        last_uploaded_swing = int(fp.read().strip())
+    r2_to_s3_glacier_backup(last_uploaded_swing, int(sys.argv[1]))
     logger.info(f"Execution took: ~{time.time() - start_of_execution:.2f}")
